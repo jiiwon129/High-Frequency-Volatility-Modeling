@@ -1,6 +1,7 @@
-numpy
-pandas
-scikit-learn
-joblib
-matplotlib
-scipy
+numpy>=1.26
+pandas>=2.0
+scipy>=1.11
+scikit-learn>=1.4
+osqp>=1.0
+matplotlib>=3.8
+threadpoolctl>=3.2

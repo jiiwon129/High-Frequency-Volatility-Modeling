@@ -1,93 +1,43 @@
 import numpy as np
-from joblib import Parallel, delayed
+
+from src.linalg import project
 
 
-def calculate_prvm_strict(
-    price_data,
-    p=200,
-    m=390,
-    num_days=997,
-    c0=4,
-    alpha_u=0.47,
-):
-    """Estimate daily volatility matrices with pre-averaging, jump truncation,
-    noise correction, and PSD projection.
+def estimate_day(log_prices):
+    """Return continuous PRVM, raw jump covariance, and 10-minute returns."""
+    log_prices = np.asarray(log_prices, dtype=float)
+    if log_prices.ndim != 2 or log_prices.shape[0] != 390:
+        raise ValueError("Expected 390 observations, from 09:30 through 15:59.")
+    if not np.isfinite(log_prices).all():
+        raise ValueError("Prices contain missing or non-finite values.")
 
-    Extracted from the final research notebook and cleaned for portfolio use.
-    """
-    if hasattr(price_data, "values"):
-        price_data = price_data.values
+    # The input has no 16:00 tick. Carry the last price forward within the day.
+    prices = np.vstack([log_prices, log_prices[-1]])
+    returns = np.diff(prices, axis=0)
+    m, k = 390, 19
+    count = m - k + 1
+    grid = np.arange(k + 1) / k
+    g = np.minimum(grid, 1 - grid)
+    preaveraged = sum(g[j] * returns[j:j + count] for j in range(1, k))
 
-    K = int(np.floor(m**0.5))
-
-    l_vec = np.arange(1, K + 1)
-    g_func = np.minimum(l_vec / K, 1 - l_vec / K)
-
-    w_bar = g_func[:-1].reshape(-1, 1)
-
-    g_padded = np.concatenate(([0], g_func))
-    w_hat = (g_padded[1:] - g_padded[:-1]) ** 2
-    w_hat = w_hat.reshape(-1, 1)
-
-    psi_K = np.sum(g_func[:-1] ** 2)
-
-    def process_day(d):
-        day_price = price_data[d * m : (d + 1) * m + 1, :]
-        raw_diffs = day_price[1:] - day_price[:-1]
-
-        current_m = len(raw_diffs)
-        T_effective = current_m - K + 1
-
-        if T_effective <= 0:
-            return np.zeros((p, p))
-
-        gamma_mat = np.zeros((p, p))
-
-        Y_bar = np.zeros((T_effective, p))
-        for k in range(T_effective):
-            window_returns = raw_diffs[k : k + K - 1]
-            Y_bar[k] = np.sum(window_returns * w_bar, axis=0)
-
-        abs_Y = np.abs(Y_bar)
-        const_pi = (m / (m - 2 * K + 1)) * (np.pi / (2 * K))
-
-        lim_idx = min(current_m - 2 * K + 1, T_effective - K)
-        if lim_idx > 0:
-            T_hat_val = const_pi * np.sum(
-                abs_Y[:lim_idx] * abs_Y[K : K + lim_idx],
-                axis=0,
-            )
-        else:
-            T_hat_val = np.zeros(p)
-
-        u_im = c0 * np.sqrt(T_hat_val) * (K / m) ** alpha_u
-        is_continuous = abs_Y <= u_im[None, :]
-
-        for k in range(T_effective):
-            y_k = Y_bar[k]
-            ind_k = is_continuous[k]
-
-            if not np.any(ind_k):
-                continue
-
-            window_returns_full = raw_diffs[k : k + K]
-            weighted_noise_rets = window_returns_full * w_hat
-            Y_hat_local = weighted_noise_rets.T @ window_returns_full
-
-            Y_bar_outer = np.outer(y_k, y_k)
-            term = Y_bar_outer - 0.5 * Y_hat_local
-
-            mask = np.outer(ind_k, ind_k)
-            gamma_mat += term * mask
-
-        gamma_final = gamma_mat / psi_K
-        eigvals, eigvecs = np.linalg.eigh(gamma_final)
-        eigvals_psd = np.maximum(eigvals, 1e-8)
-
-        return eigvecs @ np.diag(eigvals_psd) @ eigvecs.T
-
-    results = Parallel(n_jobs=-1)(
-        delayed(process_day)(d) for d in range(num_days)
+    n_pairs = m - 2 * k + 1
+    bipower = m / n_pairs * np.pi / (2 * k) * np.sum(
+        abs(preaveraged[:n_pairs]) * abs(preaveraged[k:k + n_pairs]), axis=0
     )
+    threshold = 4 * np.sqrt(np.maximum(bipower, 0)) * (k / m) ** 0.47
+    keep = abs(preaveraged) <= threshold
+    truncated = preaveraged * keep
+    noise = np.zeros((log_prices.shape[1], log_prices.shape[1]))
+    total_noise = np.zeros_like(noise)
+    for j, weight in enumerate(np.diff(g) ** 2):
+        window = returns[j:j + count]
+        selected = window * keep
+        noise += weight * (selected.T @ selected)
+        total_noise += weight * (window.T @ window)
 
-    return np.array(results)
+    # Appendix A.2 uses integral(g^2) = 1/12, not the discrete weight sum.
+    continuous_raw = (truncated.T @ truncated - 0.5 * noise) / (k / 12)
+    total_raw = (preaveraged.T @ preaveraged - 0.5 * total_noise) / (k / 12)
+    jump = total_raw - continuous_raw
+    returns_10min = np.diff(prices[::10], axis=0)
+    return project(continuous_raw), jump, returns_10min
